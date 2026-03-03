@@ -14,7 +14,8 @@ from collections import deque
 
 from fastapi import FastAPI, HTTPException, Request, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
 import asyncio
 import uvicorn
@@ -319,7 +320,16 @@ async def generic_exception_handler(request: Request, exc: Exception) -> JSONRes
         ).model_dump(mode="json")
     )
 
+# Mount static files for dashboard
+STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# Override root to serve dashboard HTML
 @app.get("/", tags=["Root"])
+async def root() -> FileResponse:
+    """Serve the dashboard HTML."""
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    return FileResponse(index_path)
 async def root() -> Dict[str, Any]:
     """Root endpoint with API information."""
     return {
