@@ -7,17 +7,18 @@ import logging
 import time
 import uuid
 import threading
+import asyncio
+import aiofiles
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from collections import deque
 
-from fastapi import FastAPI, HTTPException, Request, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, status, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, validator
-import asyncio
 import uvicorn
 
 # Rate limiting with fallback
@@ -28,12 +29,13 @@ try:
     SLOWAPI_AVAILABLE = True
 except ImportError:
     SLOWAPI_AVAILABLE = False
-    # Create dummy classes for fallback
     class RateLimitExceeded(Exception):
         pass
 
-# Import from engine
+# Import from engine and other modules
 from src.engine import load_engine
+from src.dataset_processor import get_processor
+from src.network_viz import get_network_graph
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -492,15 +494,10 @@ async def websocket_endpoint(websocket: WebSocket):
     """WebSocket endpoint for real-time updates."""
     await manager.connect(websocket)
     try:
-        # Send initial connection confirmation
         await websocket.send_json({"type": "connection", "status": "established"})
-        
-        # Keep connection alive
         while True:
             try:
-                # Wait for any client messages (ping/pong)
                 data = await websocket.receive_text()
-                # Echo back for ping
                 if data == "ping":
                     await websocket.send_text("pong")
             except WebSocketDisconnect:
@@ -510,6 +507,255 @@ async def websocket_endpoint(websocket: WebSocket):
                 break
     finally:
         await manager.disconnect(websocket)
+
+
+# =============================================================================
+# NEW API ENDPOINTS - Dataset Upload, Batch Processing, Network Topology
+# =============================================================================
+
+@app.post("/api/upload", tags=["Dataset"])
+async def upload_dataset(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Upload a dataset for batch processing.
+    Accepts CSV or Zeek conn.log format files.
+    """
+    try:
+        # Validate file size (max 50MB)
+        contents = await file.read()
+        if len(contents) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+        
+        # Save and process file
+        processor = get_processor()
+        filepath = processor.save_upload(contents, file.filename)
+        
+        # Process the uploaded file
+        result = processor.process_upload(filepath)
+        
+        if not result['success']:
+            raise HTTPException(status_code=400, detail=result.get('error', 'Processing failed'))
+        
+        # Store scoring rows in app state for batch processing
+        if not hasattr(app.state, 'pending_datasets'):
+            app.state.pending_datasets = []
+        app.state.pending_datasets.append(result['scoring_rows'])
+        
+        return {
+            "success": True,
+            "message": f"Dataset uploaded successfully",
+            "filename": file.filename,
+            "format": result['format'],
+            "total_rows": result['total_rows'],
+            "valid_rows": result['valid_rows'],
+            "ready_for_scoring": True
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Upload error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+
+@app.post("/api/batch-score", tags=["Dataset"])
+async def batch_score() -> Dict[str, Any]:
+    """
+    Run batch scoring on uploaded dataset or default IoT-2023 data.
+    Processes all rows and broadcasts results via WebSocket.
+    """
+    try:
+        if not app.state.model_loaded or app.state.engine is None:
+            return {
+                "success": False,
+                "error": "Model not loaded",
+                "processed": 0
+            }
+        
+        processor = get_processor()
+        network_graph = get_network_graph()
+        
+        # Check for pending uploaded datasets
+        scoring_rows = []
+        if hasattr(app.state, 'pending_datasets') and app.state.pending_datasets:
+            # Use uploaded dataset
+            scoring_rows = app.state.pending_datasets.pop(0)
+            logger.info(f"Processing uploaded dataset with {len(scoring_rows)} rows")
+        else:
+            # Generate sample IoT-2023 data
+            scoring_rows = generate_iot2023_sample(50)
+            logger.info(f"Processing IoT-2023 sample with {len(scoring_rows)} rows")
+        
+        # Process rows in batches
+        results = []
+        for i, row in enumerate(scoring_rows):
+            try:
+                result = app.state.engine.score_telemetry(row)
+                result['device_id'] = row.get('device_id', f'device_{i}')
+                result['timestamp'] = datetime.utcnow().isoformat()
+                results.append(result)
+                
+                # Broadcast via WebSocket
+                await manager.broadcast(result)
+                
+                # Update network graph
+                network_graph.add_or_update_node(
+                    device_id=row.get('device_id', f'device_{i}'),
+                    trust_score=result['trust_score'],
+                    verdict=result['verdict'],
+                    event_data=result
+                )
+                
+                # Small delay to prevent overwhelming
+                if i % 10 == 0:
+                    await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.debug(f"Error scoring row {i}: {e}")
+                continue
+        
+        return {
+            "success": True,
+            "message": "Batch scoring completed",
+            "processed": len(results),
+            "anomalies_detected": sum(1 for r in results if r.get('is_anomaly', False)),
+            "avg_trust_score": round(sum(r['trust_score'] for r in results) / max(1, len(results)), 2)
+        }
+    except Exception as e:
+        logger.error(f"Batch score error: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "processed": 0
+        }
+
+
+@app.get("/api/network-topology", tags=["Network"])
+async def get_network_topology() -> Dict[str, Any]:
+    """Get network topology data for visualization."""
+    try:
+        network_graph = get_network_graph()
+        return network_graph.get_network_data()
+    except Exception as e:
+        logger.error(f"Network topology error: {e}", exc_info=True)
+        return {
+            "nodes": [],
+            "links": [],
+            "stats": {
+                "total_devices": 0,
+                "network_health": 100
+            }
+        }
+
+
+@app.get("/api/devices", tags=["Network"])
+async def get_devices() -> Dict[str, Any]:
+    """Get list of all detected devices."""
+    try:
+        network_graph = get_network_graph()
+        data = network_graph.get_network_data()
+        
+        devices = []
+        for node in data['nodes']:
+            devices.append({
+                "device_id": node['id'],
+                "ip_address": node.get('ip_address', 'unknown'),
+                "trust_score": node['trust_score'],
+                "status": node['status'],
+                "events": node['events_count'],
+                "anomalies": node['anomalies_count']
+            })
+        
+        return {
+            "total": len(devices),
+            "devices": devices
+        }
+    except Exception as e:
+        logger.error(f"Get devices error: {e}", exc_info=True)
+        return {"total": 0, "devices": []}
+
+
+@app.get("/api/threats", tags=["Network"])
+async def get_threats() -> Dict[str, Any]:
+    """Get threat intelligence summary."""
+    try:
+        network_graph = get_network_graph()
+        return network_graph.get_threat_intelligence()
+    except Exception as e:
+        logger.error(f"Get threats error: {e}", exc_info=True)
+        return {
+            "active_threats": 0,
+            "critical_threats": 0,
+            "threats": []
+        }
+
+
+@app.get("/api/device/{device_id}", tags=["Network"])
+async def get_device_details(device_id: str) -> Dict[str, Any]:
+    """Get detailed information about a specific device."""
+    try:
+        network_graph = get_network_graph()
+        details = network_graph.get_device_details(device_id)
+        
+        if details is None:
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        return details
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get device details error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/train", tags=["Dataset"])
+async def train_model() -> Dict[str, Any]:
+    """
+    Trigger model retraining on uploaded dataset.
+    Note: This is a placeholder - actual training requires data_pipeline.py
+    """
+    return {
+        "success": False,
+        "message": "Training must be done offline using data_pipeline.py and train.py",
+        "instructions": "Run: python src/data_pipeline.py && python src/train.py"
+    }
+
+
+def generate_iot2023_sample(count: int = 50) -> List[Dict[str, Any]]:
+    """Generate sample IoT-2023 dataset rows for demonstration."""
+    import random
+    
+    rows = []
+    for i in range(count):
+        # Mix of normal and anomalous traffic
+        is_anomaly = random.random() < 0.2  # 20% anomaly rate
+        
+        if is_anomaly:
+            # Anomalous traffic patterns
+            row = {
+                'duration': random.uniform(5, 30),
+                'orig_bytes': random.uniform(50000, 200000),
+                'resp_bytes': random.uniform(500, 5000),
+                'orig_pkts': random.randint(200, 800),
+                'resp_pkts': random.randint(30, 150),
+                'proto': random.choice(['TCP', 'UDP', 'ICMP']),
+                'conn_state': random.choice(['REJ', 'RST', 'S0']),
+                'device_id': f'device_{random.randint(1, 20)}'
+            }
+        else:
+            # Normal traffic patterns
+            row = {
+                'duration': random.uniform(0.5, 5),
+                'orig_bytes': random.uniform(300, 3000),
+                'resp_bytes': random.uniform(1000, 8000),
+                'orig_pkts': random.randint(10, 40),
+                'resp_pkts': random.randint(15, 50),
+                'proto': random.choice(['TCP', 'TCP', 'TCP', 'UDP']),  # TCP more common
+                'conn_state': 'SF',
+                'device_id': f'device_{random.randint(1, 20)}'
+            }
+        
+        rows.append(row)
+    
+    return rows
+
 
 if __name__ == "__main__":
     """Run the API server."""

@@ -2,6 +2,7 @@
 venv/
 .venv/
 env/
+ENV/
 
 # Python
 __pycache__/
@@ -20,27 +21,54 @@ data/raw/*
 data/processed/*
 !data/processed/.gitkeep
 
-# Model files (large binaries)
-models/*.pkl
-models/*.h5
-models/*.pt
-models/*.pth
-models/*.joblib
-models/*.onnx
+data/uploads/*
+!data/uploads/.gitkeep
+
+# Model files (large binaries) - keep for local dev but can be regenerated
+# Uncomment if you want to track models in git
+# models/*.pkl
+# models/*.h5
+# models/*.pt
+# models/*.pth
+# models/*.joblib
+# models/*.onnx
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*~
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
 
 # Environment variables
 .env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Documentation
+docs/_build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Render
+.render/

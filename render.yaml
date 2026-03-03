@@ -2,8 +2,10 @@ services:
   - type: web
     name: iot-sentinel
     runtime: python
+    region: oregon
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn src.api_server:app --host 0.0.0.0 --port $PORT
+    startCommand: bash start.sh
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
@@ -11,3 +13,13 @@ services:
         value: "10000"
       - key: RELOAD
         value: "false"
+      - key: HOST
+        value: "0.0.0.0"
+      - key: RENDER
+        value: "true"
+    disk:
+      name: iot-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1
+    healthCheckPath: /health
+    autoDeploy: true
